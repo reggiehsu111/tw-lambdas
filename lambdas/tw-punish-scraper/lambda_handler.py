@@ -28,9 +28,15 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/143.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
     "Referer": "https://www.twse.com.tw/zh/announcement/punish.html",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 # Taiwan time = UTC+8
@@ -54,7 +60,20 @@ def tw_date_to_iso(tw_date: str) -> str:
 
 def fetch_punish_data(date_str: str) -> dict:
     """Fetch 處置股 data from TWSE for a given date (YYYYMMDD)."""
-    url = f"{TWSE_API}?startDate={date_str}&endDate={date_str}&response=json"
+    import time as _time
+    cache_bust = int(_time.time() * 1000)
+    url = (
+        f"{TWSE_API}"
+        f"?startDate={date_str}&endDate={date_str}"
+        f"&querytype=3"       # all types
+        f"&stockNo="
+        f"&selectType="
+        f"&proceType="
+        f"&remarkType="
+        f"&sortKind=DATE"
+        f"&response=json"
+        f"&_={cache_bust}"   # cache buster (matches browser behaviour)
+    )
     print(f"Fetching: {url}")
 
     req = urllib.request.Request(url, headers=HEADERS)
