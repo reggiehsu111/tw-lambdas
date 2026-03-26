@@ -21,6 +21,9 @@ from datetime import datetime, timedelta, timezone, date
 import boto3
 import psycopg2
 import psycopg2.extras
+import pandas_market_calendars as mcal
+
+_TW_CAL = mcal.get_calendar('XTAI')
 
 # ── Config from environment ───────────────────────────────────────────────────
 S3_BUCKET           = os.environ.get("S3_BUCKET", "tw-lambdas-data")
@@ -67,9 +70,7 @@ def tw_date_to_iso(tw_date: str) -> date | None:
 
 
 def parse_period(period_str: str) -> tuple[date | None, date | None]:
-    """
-    Parse period string like '115/03/26～115/04/10' into (start_date, end_date).
-    """
+    """Parse '115/03/26～115/04/10' → (start_date, end_date) as Python dates."""
     try:
         parts = re.split(r"[～~]", period_str.strip())
         start = tw_date_to_iso(parts[0].strip()) if len(parts) > 0 else None
@@ -77,6 +78,24 @@ def parse_period(period_str: str) -> tuple[date | None, date | None]:
         return start, end
     except Exception:
         return None, None
+
+
+def trading_exit_date(start_date: date, n_trading_days: int = 6) -> date | None:
+    """Return start_date + n trading days (XTAI calendar)."""
+    if start_date is None:
+        return None
+    try:
+        sessions = _TW_CAL.valid_days(
+            start_date=start_date,
+            end_date=date(start_date.year, start_date.month, start_date.day) + timedelta(days=60),
+        )
+        dates = [s.date() for s in sessions]
+        idx = dates.index(start_date) if start_date in dates else next(
+            i for i, d in enumerate(dates) if d >= start_date
+        )
+        return dates[idx + n_trading_days]
+    except Exception:
+        return None
 
 
 def fetch_punish_data(date_str: str) -> dict:
@@ -134,6 +153,7 @@ def parse_records(data: dict) -> list[dict]:
             "condition":     str(r.get("處置條件", "")).strip(),
             "start_date":    start_date,
             "end_date":      end_date,
+            "exit_date":     trading_exit_date(start_date, 6),  # 6 trading days from start
             "measure":       str(r.get("處置措施", "")).strip(),
             "content":       str(r.get("處置內容", "")).strip(),
             "remark":        remark_clean or None,
@@ -158,10 +178,11 @@ def write_to_db(records: list[dict]) -> int:
                     cur.execute("""
                         INSERT INTO tw_punish_stocks
                             (announce_date, stock_code, stock_name, punish_count,
-                             condition, start_date, end_date, measure, content, remark)
+                             condition, start_date, end_date, exit_date, measure, content, remark)
                         VALUES
                             (%(announce_date)s, %(stock_code)s, %(stock_name)s, %(punish_count)s,
-                             %(condition)s, %(start_date)s, %(end_date)s, %(measure)s, %(content)s, %(remark)s)
+                             %(condition)s, %(start_date)s, %(end_date)s, %(exit_date)s,
+                             %(measure)s, %(content)s, %(remark)s)
                         ON CONFLICT (announce_date, stock_code, start_date) DO NOTHING
                     """, r)
                     inserted += cur.rowcount
@@ -210,13 +231,14 @@ def get_active_positions(target_date: date) -> list[dict]:
                     stock_code,
                     stock_name,
                     start_date,
-                    (start_date + 6) AS exit_date,
+                    exit_date,
                     measure
                 FROM tw_punish_stocks
                 WHERE
                     start_date IS NOT NULL
-                    AND announce_date  <= %(d)s
-                    AND (start_date + 6) >= %(d)s
+                    AND exit_date IS NOT NULL
+                    AND announce_date <= %(d)s
+                    AND exit_date     >= %(d)s
                 ORDER BY announce_date DESC, stock_code
             """, {"d": target_date})
             return [dict(r) for r in cur.fetchall()]

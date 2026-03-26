@@ -4,16 +4,17 @@ punish_weights.py
 Calculates daily equal-weight long positions for 處置股 strategy.
 
 Strategy rules:
-  - LONG all 處置股 from announce_date through (start_date + 6 calendar days) inclusive
+  - LONG all 處置股 from announce_date through (start_date + 6 **trading** days) inclusive
   - Equal weight across all active positions, rebalanced daily
   - Weight = 1 / N  (N = number of active stocks on that day)
+  - Trading calendar: XTAI (Taiwan Stock Exchange)
 
 Usage:
     from punish_weights import get_weights_for_date, get_weights_range
 
     # Single day
     weights = get_weights_for_date(date(2026, 3, 26))
-    # → {'6515': 0.1, '2337': 0.1, ...}
+    # → {'6515': 0.0625, '2337': 0.0625, ...}
 
     # Range of dates (returns DataFrame)
     df = get_weights_range(date(2026, 1, 1), date(2026, 3, 26))
@@ -37,7 +38,7 @@ DB_CONFIG = {
     "password": os.environ.get("DB_PASSWORD", "e74G2UWuxTDYr1j5Mtf7"),
 }
 
-HOLD_DAYS_AFTER_START = 6  # hold through start_date + N calendar days
+HOLD_TRADING_DAYS = 6  # start_date + N trading days (XTAI), precomputed as exit_date in DB
 
 
 def _get_conn():
@@ -48,9 +49,9 @@ def _load_punish_records(start_window: date, end_window: date) -> pd.DataFrame:
     """
     Load 處置股 records whose holding window overlaps [start_window, end_window].
 
-    Holding window for each record:
+    Holding window per record:
         entry = announce_date
-        exit  = start_date + HOLD_DAYS_AFTER_START
+        exit  = exit_date  (precomputed in DB = start_date + 6 XTAI trading days)
     """
     conn = _get_conn()
     try:
@@ -60,18 +61,16 @@ def _load_punish_records(start_window: date, end_window: date) -> pd.DataFrame:
                 stock_code,
                 stock_name,
                 start_date,
-                (start_date + %(hold_days)s * INTERVAL '1 day')::date AS exit_date
+                exit_date
             FROM tw_punish_stocks
             WHERE
-                start_date IS NOT NULL
-                AND announce_date IS NOT NULL
-                -- record is active on at least one day in our window
-                AND announce_date                                          <= %(end_window)s
-                AND (start_date + %(hold_days)s * INTERVAL '1 day')::date >= %(start_window)s
+                start_date  IS NOT NULL
+                AND exit_date IS NOT NULL
+                AND announce_date <= %(end_window)s
+                AND exit_date     >= %(start_window)s
         """
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, {
-                "hold_days":    HOLD_DAYS_AFTER_START,
                 "start_window": start_window,
                 "end_window":   end_window,
             })
@@ -92,7 +91,7 @@ def get_weights_for_date(target_date: date) -> dict[str, float]:
     Return equal-weight long positions for a single date.
 
     A stock is active on `target_date` if:
-        announce_date <= target_date <= start_date + HOLD_DAYS_AFTER_START
+        announce_date <= target_date <= exit_date
 
     Returns:
         dict mapping stock_code → weight (sums to 1.0, or empty dict if no positions)
@@ -156,20 +155,21 @@ def get_weights_range(
 
 # ── Quick sanity check ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    from datetime import date
-
     print("=" * 60)
-    print(f"Hold period: announce_date → start_date + {HOLD_DAYS_AFTER_START} days")
+    print(f"Hold period: announce_date → start_date + {HOLD_TRADING_DAYS} trading days (XTAI)")
     print("=" * 60)
 
-    # Single-day weights
     today = date(2026, 3, 26)
     weights = get_weights_for_date(today)
     print(f"\n📅 Weights for {today}:  ({len(weights)} positions, each = {next(iter(weights.values()), 0):.4f})")
     for code, w in sorted(weights.items()):
         print(f"   {code}  {w:.4f}")
 
-    # Range view — last 7 days
     df = get_weights_range(date(2026, 3, 20), date(2026, 3, 26))
     print(f"\n📊 Range 2026-03-20 ~ 2026-03-26:  {len(df)} position-days")
     print(df.groupby("date")["stock_code"].count().rename("n_positions").to_string())
+
+    # Show exit dates for sanity check
+    print("\n📅 Sample exit dates (trading day based):")
+    sample = df[df["date"] == today][["stock_code", "stock_name", "start_date", "exit_date"]].head(5)
+    print(sample.to_string(index=False))

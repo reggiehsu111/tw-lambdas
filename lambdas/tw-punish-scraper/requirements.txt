@@ -1,1 +1,2 @@
 psycopg2-binary==2.9.9
+pandas-market-calendars==4.4.1
