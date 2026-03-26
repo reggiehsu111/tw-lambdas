@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "expression": "cron(0 9 ? * MON-FRI *)",
+  "description": "Run at 09:00 UTC (17:00 TW time) on weekdays — after TWSE closing"
+}

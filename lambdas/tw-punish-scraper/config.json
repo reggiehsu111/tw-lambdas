@@ -1,0 +1,13 @@
+{
+  "function_name": "tw-punish-scraper",
+  "description": "Daily scraper for TWSE 處置有價證券 (punished stocks)",
+  "handler": "lambda_handler.lambda_handler",
+  "runtime": "python3.11",
+  "timeout": 60,
+  "memory": 256,
+  "env_vars": {
+    "S3_BUCKET": "tw-lambdas-data",
+    "S3_PREFIX": "punish",
+    "DISCORD_WEBHOOK_URL": ""
+  }
+}

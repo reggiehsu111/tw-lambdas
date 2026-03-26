@@ -308,6 +308,62 @@ def deploy(session: boto3.Session, config: dict, zip_path: Path, role_arn: str):
     print(f"{'=' * 50}")
 
 
+def setup_eventbridge_schedule(session: boto3.Session, function_name: str, schedule_path: Path) -> None:
+    """Set up EventBridge schedule from schedule.json if present."""
+    if not schedule_path.exists():
+        return
+
+    with open(schedule_path) as f:
+        sched = json.load(f)
+
+    if not sched.get("enabled", False):
+        print(f"  schedule.json found but enabled=false, skipping")
+        return
+
+    expression = sched["expression"]
+    description = sched.get("description", f"Schedule for {function_name}")
+
+    events = session.client("events")
+    lam = session.client("lambda")
+    sts = session.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+
+    rule_name = f"{function_name}-schedule"
+    lambda_arn = f"arn:aws:lambda:{AWS_REGION}:{account_id}:function:{function_name}"
+
+    print(f"\n⏰ Setting up EventBridge schedule: {expression}")
+
+    # Create/update rule
+    response = events.put_rule(
+        Name=rule_name,
+        ScheduleExpression=expression,
+        State="ENABLED",
+        Description=description,
+    )
+    rule_arn = response["RuleArn"]
+
+    # Add Lambda as target
+    events.put_targets(
+        Rule=rule_name,
+        Targets=[{"Id": "1", "Arn": lambda_arn}],
+    )
+
+    # Grant EventBridge permission to invoke Lambda
+    try:
+        lam.remove_permission(FunctionName=function_name, StatementId="EventBridgeInvoke")
+    except lam.exceptions.ResourceNotFoundException:
+        pass
+    lam.add_permission(
+        FunctionName=function_name,
+        StatementId="EventBridgeInvoke",
+        Action="lambda:InvokeFunction",
+        Principal="events.amazonaws.com",
+        SourceArn=rule_arn,
+    )
+    print(f"  ✅ Schedule set: {expression}")
+    print(f"     Description: {description}")
+
+
 def main():
     args = parse_args()
 
@@ -340,6 +396,9 @@ def main():
     role_arn = get_or_create_role(session)
 
     deploy(session, config, zip_path, role_arn)
+
+    # EventBridge schedule (optional)
+    setup_eventbridge_schedule(session, config["function_name"], lambda_dir / "schedule.json")
 
     # Cleanup zip
     zip_path.unlink()
