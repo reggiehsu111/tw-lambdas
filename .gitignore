@@ -1,0 +1,17 @@
+# Build artifacts
+*.zip
+.build_*/
+lambda_package/
+lambda_build/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+
+# Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

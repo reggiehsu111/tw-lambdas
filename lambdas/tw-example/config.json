@@ -1,0 +1,11 @@
+{
+  "function_name": "tw-example",
+  "description": "Example tw-lambdas Lambda",
+  "handler": "lambda_handler.lambda_handler",
+  "runtime": "python3.11",
+  "timeout": 60,
+  "memory": 256,
+  "env_vars": {
+    "ENV": "production"
+  }
+}
