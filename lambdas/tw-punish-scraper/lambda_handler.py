@@ -195,41 +195,83 @@ def save_to_s3(records: list[dict], date_str: str) -> str:
     return s3_key
 
 
-def send_discord(records: list[dict], date_str: str, inserted: int) -> None:
+def get_active_positions(target_date: date) -> list[dict]:
+    """Query DB for currently active 處置股 positions on target_date."""
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD,
+        connect_timeout=10,
+    )
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    announce_date,
+                    stock_code,
+                    stock_name,
+                    start_date,
+                    (start_date + 6) AS exit_date,
+                    measure
+                FROM tw_punish_stocks
+                WHERE
+                    start_date IS NOT NULL
+                    AND announce_date  <= %(d)s
+                    AND (start_date + 6) >= %(d)s
+                ORDER BY announce_date DESC, stock_code
+            """, {"d": target_date})
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def send_discord(date_str: str, inserted: int) -> None:
     if not DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL not set, skipping")
         return
 
-    date_label = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    target_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:]))
+    date_label  = target_date.isoformat()
 
-    if not records:
-        message = f"📋 **{date_label} 處置股** — 今日無新增處置股"
+    positions = get_active_positions(target_date)
+    n         = len(positions)
+    weight    = round(1.0 / n, 4) if n > 0 else 0
+
+    if not positions:
+        message = f"📋 **{date_label} 處置股策略** — 今日無持倉"
     else:
-        lines = [f"📋 **{date_label} 處置股** — 共 {len(records)} 檔（新寫入 {inserted} 筆）\n"]
-        for r in records:
-            count_label = f"（第{r['punish_count']}次）" if r.get("punish_count") else ""
-            s = r["start_date"].isoformat() if r["start_date"] else "?"
-            e = r["end_date"].isoformat()   if r["end_date"]   else "?"
+        lines = [
+            f"📋 **{date_label} 處置股策略**",
+            f"持倉 {n} 檔　各佔 {weight*100:.2f}%　新寫入 {inserted} 筆",
+            "",
+        ]
+        for p in positions:
             lines.append(
-                f"• **{r['stock_code']} {r['stock_name']}** {count_label}"
-                f"　{s} ～ {e}　{r['measure']}"
+                f"• **{p['stock_code']} {p['stock_name']}**"
+                f"　公布 {p['announce_date']}"
+                f"　{p['start_date']} ～ {p['exit_date']}"
             )
         message = "\n".join(lines)
 
-    if len(message) > 1900:
-        message = message[:1900] + "\n…（更多請查 DB）"
+    # Discord 2000 char limit — split into chunks if needed
+    chunks = []
+    while len(message) > 1900:
+        split = message[:1900].rfind("\n")
+        chunks.append(message[:split])
+        message = message[split:]
+    chunks.append(message)
 
-    payload = json.dumps({"content": message}).encode("utf-8")
-    req = urllib.request.Request(
-        DISCORD_WEBHOOK_URL, data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "tw-punish-scraper/1.0"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"Discord notified: HTTP {resp.status}")
-    except Exception as e:
-        print(f"Discord notification failed (non-fatal): {e}")
+    for chunk in chunks:
+        payload = json.dumps({"content": chunk}).encode("utf-8")
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL, data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "tw-punish-scraper/1.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"Discord notified: HTTP {resp.status}")
+        except Exception as e:
+            print(f"Discord notification failed (non-fatal): {e}")
 
 
 def lambda_handler(event, context):
@@ -245,7 +287,7 @@ def lambda_handler(event, context):
 
     inserted = write_to_db(records)
     s3_key   = save_to_s3(records, date_str)
-    send_discord(records, date_str, inserted)
+    send_discord(date_str, inserted)
 
     return {
         "statusCode": 200,
