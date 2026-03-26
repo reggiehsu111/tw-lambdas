@@ -8,6 +8,6 @@
   "env_vars": {
     "S3_BUCKET": "tw-lambdas-data",
     "S3_PREFIX": "punish",
-    "DISCORD_WEBHOOK_URL": ""
+    "DISCORD_WEBHOOK_URL": "set-in-lambda-env"
   }
 }
