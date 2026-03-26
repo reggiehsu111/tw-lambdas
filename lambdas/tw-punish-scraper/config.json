@@ -8,6 +8,11 @@
   "env_vars": {
     "S3_BUCKET": "tw-lambdas-data",
     "S3_PREFIX": "punish",
-    "DISCORD_WEBHOOK_URL": "set-in-lambda-env"
+    "DISCORD_WEBHOOK_URL": "set-in-lambda-env",
+    "DB_HOST": "quant-db.cluster-c1igmy0yu89z.ap-northeast-1.rds.amazonaws.com",
+    "DB_PORT": "5432",
+    "DB_NAME": "quant_data",
+    "DB_USER": "quant_master",
+    "DB_PASSWORD": "set-in-lambda-env"
   }
 }

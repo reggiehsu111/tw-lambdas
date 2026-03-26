@@ -1,2 +1,1 @@
-# boto3 is provided by the Lambda runtime, no extra deps needed
-# urllib is stdlib — no requests required
+psycopg2-binary==2.9.9

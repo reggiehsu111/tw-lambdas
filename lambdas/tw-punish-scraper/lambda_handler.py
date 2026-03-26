@@ -1,27 +1,37 @@
 """
 tw-punish-scraper
 
-每日從 TWSE 抓取處置有價證券清單，存到 S3，並發 Discord 通知。
+每日從 TWSE 抓取處置有價證券清單，寫入 PostgreSQL (quant_data.tw_punish_stocks)，
+存到 S3，並發 Discord 通知。
 
 TWSE API:
   GET https://www.twse.com.tw/rwd/zh/announcement/punish
-      ?startDate=YYYYMMDD&endDate=YYYYMMDD&response=json
+      ?startDate=YYYYMMDD&endDate=YYYYMMDD&querytype=3&response=json
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import boto3
+import psycopg2
+import psycopg2.extras
 
 # ── Config from environment ───────────────────────────────────────────────────
-S3_BUCKET = os.environ.get("S3_BUCKET", "tw-lambdas-data")
-S3_PREFIX = os.environ.get("S3_PREFIX", "punish")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")  # optional
+S3_BUCKET           = os.environ.get("S3_BUCKET", "tw-lambdas-data")
+S3_PREFIX           = os.environ.get("S3_PREFIX", "punish")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+DB_HOST     = os.environ.get("DB_HOST", "quant-db.cluster-c1igmy0yu89z.ap-northeast-1.rds.amazonaws.com")
+DB_PORT     = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME     = os.environ.get("DB_NAME", "quant_data")
+DB_USER     = os.environ.get("DB_USER", "quant_master")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "e74G2UWuxTDYr1j5Mtf7")
 
 TWSE_API = "https://www.twse.com.tw/rwd/zh/announcement/punish"
 HEADERS = {
@@ -39,142 +49,180 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-# Taiwan time = UTC+8
 TW_TZ = timezone(timedelta(hours=8))
 
 
 def get_today_tw() -> str:
-    """Return today's date in Taiwan time as YYYYMMDD."""
     return datetime.now(TW_TZ).strftime("%Y%m%d")
 
 
-def tw_date_to_iso(tw_date: str) -> str:
-    """Convert ROC date (115/03/26) → ISO (2026-03-26)."""
+def tw_date_to_iso(tw_date: str) -> date | None:
+    """Convert ROC date string (115/03/26) → Python date (2026-03-26)."""
     try:
         parts = tw_date.strip().split("/")
         year = int(parts[0]) + 1911
-        return f"{year}-{parts[1]}-{parts[2]}"
+        return date(year, int(parts[1]), int(parts[2]))
     except Exception:
-        return tw_date
+        return None
+
+
+def parse_period(period_str: str) -> tuple[date | None, date | None]:
+    """
+    Parse period string like '115/03/26～115/04/10' into (start_date, end_date).
+    """
+    try:
+        parts = re.split(r"[～~]", period_str.strip())
+        start = tw_date_to_iso(parts[0].strip()) if len(parts) > 0 else None
+        end   = tw_date_to_iso(parts[1].strip()) if len(parts) > 1 else None
+        return start, end
+    except Exception:
+        return None, None
 
 
 def fetch_punish_data(date_str: str) -> dict:
-    """Fetch 處置股 data from TWSE for a given date (YYYYMMDD)."""
     import time as _time
     cache_bust = int(_time.time() * 1000)
     url = (
         f"{TWSE_API}"
         f"?startDate={date_str}&endDate={date_str}"
-        f"&querytype=3"       # all types
-        f"&stockNo="
-        f"&selectType="
-        f"&proceType="
-        f"&remarkType="
+        f"&querytype=3"
+        f"&stockNo=&selectType=&proceType=&remarkType="
         f"&sortKind=DATE"
         f"&response=json"
-        f"&_={cache_bust}"   # cache buster (matches browser behaviour)
+        f"&_={cache_bust}"
     )
     print(f"Fetching: {url}")
-
     req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code} fetching TWSE API") from e
-
     data = json.loads(raw)
     if data.get("stat") != "OK":
         raise RuntimeError(f"TWSE API returned stat={data.get('stat')}")
-
     return data
 
 
 def parse_records(data: dict) -> list[dict]:
-    """Parse raw API response into clean records."""
     fields = data.get("fields", [])
-    rows = data.get("data", [])
-
+    rows   = data.get("data", [])
     records = []
-    seen = set()  # deduplicate by (stock_code, announce_date)
+    seen = set()
 
     for row in rows:
-        record = dict(zip(fields, row))
-        stock_code = str(record.get("證券代號", "")).strip()
-        announce_date = record.get("公布日期", "")
+        r = dict(zip(fields, row))
+        stock_code   = str(r.get("證券代號", "")).strip()
+        announce_date = tw_date_to_iso(str(r.get("公布日期", "")))
+        period_str   = str(r.get("處置起迄時間", "")).strip()
+        start_date, end_date = parse_period(period_str)
 
-        key = (stock_code, announce_date)
+        key = (stock_code, str(announce_date), str(start_date))
         if key in seen:
             continue
         seen.add(key)
 
+        # Strip HTML from remark field
+        remark_raw = str(r.get("備註", ""))
+        remark_clean = re.sub(r"<[^>]+>", "", remark_raw).strip()
+
         records.append({
-            "announce_date": tw_date_to_iso(announce_date),
-            "stock_code": stock_code,
-            "stock_name": str(record.get("證券名稱", "")).strip(),
-            "punish_count": record.get("累計", ""),
-            "condition": str(record.get("處置條件", "")).strip(),
-            "period": str(record.get("處置起迄時間", "")).strip(),
-            "measure": str(record.get("處置措施", "")).strip(),
+            "announce_date": announce_date,
+            "stock_code":    stock_code,
+            "stock_name":    str(r.get("證券名稱", "")).strip(),
+            "punish_count":  r.get("累計"),
+            "condition":     str(r.get("處置條件", "")).strip(),
+            "start_date":    start_date,
+            "end_date":      end_date,
+            "measure":       str(r.get("處置措施", "")).strip(),
+            "content":       str(r.get("處置內容", "")).strip(),
+            "remark":        remark_clean or None,
         })
 
-    # Sort by announce_date desc, then stock_code
-    records.sort(key=lambda r: (r["announce_date"], r["stock_code"]), reverse=True)
+    records.sort(key=lambda x: (str(x["announce_date"]), x["stock_code"]), reverse=True)
     return records
 
 
+def write_to_db(records: list[dict]) -> int:
+    """Upsert records into tw_punish_stocks. Returns number of rows inserted."""
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD,
+        connect_timeout=10,
+    )
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                inserted = 0
+                for r in records:
+                    cur.execute("""
+                        INSERT INTO tw_punish_stocks
+                            (announce_date, stock_code, stock_name, punish_count,
+                             condition, start_date, end_date, measure, content, remark)
+                        VALUES
+                            (%(announce_date)s, %(stock_code)s, %(stock_name)s, %(punish_count)s,
+                             %(condition)s, %(start_date)s, %(end_date)s, %(measure)s, %(content)s, %(remark)s)
+                        ON CONFLICT (announce_date, stock_code, start_date) DO NOTHING
+                    """, r)
+                    inserted += cur.rowcount
+        print(f"DB: inserted {inserted} new rows (skipped {len(records) - inserted} duplicates)")
+        return inserted
+    finally:
+        conn.close()
+
+
 def save_to_s3(records: list[dict], date_str: str) -> str:
-    """Save records as JSON to S3. Returns S3 key."""
     s3 = boto3.client("s3")
     s3_key = f"{S3_PREFIX}/{date_str[:4]}/{date_str[4:6]}/{date_str}.json"
 
+    # Convert date objects to strings for JSON serialisation
+    serialisable = [
+        {k: (v.isoformat() if isinstance(v, date) else v) for k, v in r.items()}
+        for r in records
+    ]
     payload = {
-        "scrape_date": date_str,
+        "scrape_date":     date_str,
         "scrape_time_utc": datetime.utcnow().isoformat() + "Z",
-        "total": len(records),
-        "records": records,
+        "total":           len(records),
+        "records":         serialisable,
     }
-
     s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=s3_key,
+        Bucket=S3_BUCKET, Key=s3_key,
         Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
         ContentType="application/json; charset=utf-8",
     )
-    print(f"Saved {len(records)} records to s3://{S3_BUCKET}/{s3_key}")
+    print(f"S3: saved {len(records)} records to s3://{S3_BUCKET}/{s3_key}")
     return s3_key
 
 
-def send_discord(records: list[dict], date_str: str) -> None:
-    """Send a summary to Discord webhook (if configured)."""
+def send_discord(records: list[dict], date_str: str, inserted: int) -> None:
     if not DISCORD_WEBHOOK_URL:
-        print("DISCORD_WEBHOOK_URL not set, skipping notification")
+        print("DISCORD_WEBHOOK_URL not set, skipping")
         return
 
-    # Format date nicely
     date_label = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
     if not records:
         message = f"📋 **{date_label} 處置股** — 今日無新增處置股"
     else:
-        lines = [f"📋 **{date_label} 處置股** — 共 {len(records)} 檔\n"]
+        lines = [f"📋 **{date_label} 處置股** — 共 {len(records)} 檔（新寫入 {inserted} 筆）\n"]
         for r in records:
-            count_label = f"（第{r['punish_count']}次）" if r["punish_count"] else ""
+            count_label = f"（第{r['punish_count']}次）" if r.get("punish_count") else ""
+            s = r["start_date"].isoformat() if r["start_date"] else "?"
+            e = r["end_date"].isoformat()   if r["end_date"]   else "?"
             lines.append(
                 f"• **{r['stock_code']} {r['stock_name']}** {count_label}"
-                f"\n  處置期間：{r['period']}　措施：{r['measure']}"
+                f"　{s} ～ {e}　{r['measure']}"
             )
         message = "\n".join(lines)
 
-    # Discord has 2000 char limit per message
     if len(message) > 1900:
-        message = message[:1900] + "\n…（更多請查 S3）"
+        message = message[:1900] + "\n…（更多請查 DB）"
 
     payload = json.dumps({"content": message}).encode("utf-8")
     req = urllib.request.Request(
-        DISCORD_WEBHOOK_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
+        DISCORD_WEBHOOK_URL, data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "tw-punish-scraper/1.0"},
         method="POST",
     )
     try:
@@ -185,34 +233,24 @@ def send_discord(records: list[dict], date_str: str) -> None:
 
 
 def lambda_handler(event, context):
-    """
-    Entry point.
-
-    event can optionally contain:
-      - "date": "YYYYMMDD"  (override scrape date, default = today TW time)
-    """
     date_str = event.get("date") if isinstance(event, dict) else None
     if not date_str:
         date_str = get_today_tw()
 
     print(f"Scraping 處置股 for date: {date_str}")
 
-    try:
-        raw_data = fetch_punish_data(date_str)
-        records = parse_records(raw_data)
-        print(f"Found {len(records)} unique 處置股 records")
+    raw_data = fetch_punish_data(date_str)
+    records  = parse_records(raw_data)
+    print(f"Found {len(records)} unique records")
 
-        s3_key = save_to_s3(records, date_str)
-        send_discord(records, date_str)
+    inserted = write_to_db(records)
+    s3_key   = save_to_s3(records, date_str)
+    send_discord(records, date_str, inserted)
 
-        return {
-            "statusCode": 200,
-            "date": date_str,
-            "total": len(records),
-            "s3_key": s3_key,
-            "records": records,
-        }
-
-    except Exception as e:
-        print(f"ERROR: {e}")
-        raise
+    return {
+        "statusCode": 200,
+        "date":       date_str,
+        "total":      len(records),
+        "inserted":   inserted,
+        "s3_key":     s3_key,
+    }
