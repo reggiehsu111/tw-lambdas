@@ -168,58 +168,62 @@ def fetch_twse(date_str: str) -> list[dict]:
 
 
 def fetch_tpex(action: str, source_name: str) -> list[dict]:
-    """Fetch TPEX (上櫃/興櫃) disposal data — returns current active disposals."""
-    url    = f"{TPEX_API}/{action}"
+    """
+    Fetch TPEX (上櫃/興櫃) disposal data via CSV download.
+    TPEX requires YYYY/MM/DD date format. Without a historical start date
+    it returns only currently-active disposals, which is what we want for daily updates.
+    """
+    import csv as _csv
+    url        = f"{TPEX_API}/{action}"
+    today_str  = datetime.now(TW_TZ).strftime("%Y/%m/%d")
+    # Use a 30-day lookback to catch newly announced stocks
+    start_str  = (datetime.now(TW_TZ) - timedelta(days=30)).strftime("%Y/%m/%d")
+
     params = urllib.parse.urlencode({
-        "startDate": "20110401", "endDate": get_today_tw(),
+        "startDate": start_str,
+        "endDate":   today_str,
         "type": "all", "reason": "-1", "measure": "-1",
-        "order": "date", "response": "json",
+        "order": "date", "response": "csv",
     }).encode("utf-8")
 
-    print(f"[{source_name}] Fetching: {url}")
+    print(f"[{source_name}] Fetching CSV: {start_str} → {today_str}")
     req = urllib.request.Request(url, data=params, headers=TPEX_HEADERS, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("ms950", errors="replace")
     except Exception as e:
         raise RuntimeError(f"{source_name} fetch failed: {e}") from e
 
-    if data.get("stat") != "ok":
-        raise RuntimeError(f"{source_name} stat={data.get('stat')}")
-
-    tables = data.get("tables", [])
-    if not tables or "data" not in tables[0] or not tables[0]["data"]:
-        return []
-
-    fields = tables[0]["fields"]
-    rows   = tables[0]["data"]
+    lines = raw.splitlines()
+    # Lines: [0] title, [1] period, [2] headers, [3+] data
     records = []
-
-    for row in rows:
-        r    = dict(zip(fields, row))
-        code = str(r.get("證券代號", "")).strip()
-        name = re.sub(r"\(.*?\)$", "", str(r.get("證券名稱", ""))).strip()
-        if not code or not name:
+    reader = _csv.reader(lines[3:])
+    for row in reader:
+        if len(row) < 5:
             continue
-
-        announce_d          = tw_date_to_iso(str(r.get("公布日期", "")))
-        start_d, end_d      = parse_period(str(r.get("處置起訖時間", "")))
-        punish_raw          = str(r.get("累計", ""))
-
-        records.append({
-            "source":        source_name,
-            "announce_date": announce_d,
-            "stock_code":    code,
-            "stock_name":    name,
-            "punish_count":  int(punish_raw) if punish_raw.isdigit() else None,
-            "condition":     str(r.get("處置原因", "")).strip(),
-            "start_date":    start_d,
-            "end_date":      end_d,
-            "exit_date":     trading_exit_date(start_d, 6),
-            "measure":       None,
-            "content":       str(r.get("處置內容", "")).strip(),
-            "remark":        None,
-        })
+        try:
+            code = row[2].strip()
+            name = re.sub(r'\s*\(.*?\)\s*$', '', row[3]).strip()
+            if not code or not name:
+                continue
+            announce_d     = tw_date_to_iso(row[1])
+            start_d, end_d = parse_period(row[4])
+            records.append({
+                "source":        source_name,
+                "announce_date": announce_d,
+                "stock_code":    code,
+                "stock_name":    name,
+                "punish_count":  None,
+                "condition":     row[5].strip() if len(row) > 5 else None,
+                "start_date":    start_d,
+                "end_date":      end_d,
+                "exit_date":     trading_exit_date(start_d, 6),
+                "measure":       None,
+                "content":       row[6].strip() if len(row) > 6 else None,
+                "remark":        None,
+            })
+        except Exception:
+            pass
     print(f"[{source_name}] {len(records)} records")
     return records
 

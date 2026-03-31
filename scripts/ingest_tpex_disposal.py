@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
 """
-Ingest TPEX disposal data into the disposal table.
+Ingest TPEX disposal data into the disposal table via CSV download.
 
-Covers two TPEX sources:
-  - TPEX-OTC  (上櫃): https://www.tpex.org.tw/zh-tw/announce/market/disposal.html
-  - TPEX-ESB  (興櫃): https://www.tpex.org.tw/zh-tw/announce/market/esb-disposal.html
+TPEX CSV requires dates in YYYY/MM/DD format.
+Full history available from 2011/04/01.
+
+Sources:
+  TPEX-OTC  (上櫃): bulletin/disposal
+  TPEX-ESB  (興櫃): bulletin/disposalEsb
 
 Usage:
-    # Full historical backfill (2011-04-01 to today)
-    python3 ingest_tpex_disposal.py
-
-    # Specific date range
-    python3 ingest_tpex_disposal.py --start 20260101 --end 20260331
-
-    # Single source
-    python3 ingest_tpex_disposal.py --source TPEX-OTC
-    python3 ingest_tpex_disposal.py --source TPEX-ESB
+    python3 ingest_tpex_disposal.py                          # full backfill
+    python3 ingest_tpex_disposal.py --start 2026/01/01       # custom start
+    python3 ingest_tpex_disposal.py --source TPEX-OTC        # single source
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import re
 import sys
-import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional
 
 import psycopg2
-import psycopg2.extras
 import pandas_market_calendars as mcal
 
-# ── Config ────────────────────────────────────────────────────────────────────
 TW_TZ   = timezone(timedelta(hours=8))
 TW_CAL  = mcal.get_calendar('XTAI')
 
@@ -43,36 +37,32 @@ DB_CONFIG = dict(
     port=5432, dbname="quant_data", user="quant_master", password="e74G2UWuxTDYr1j5Mtf7",
 )
 
-TPEX_SOURCES = {
-    "TPEX-OTC": "bulletin/disposal",       # 上櫃
-    "TPEX-ESB": "bulletin/disposalEsb",    # 興櫃
-}
-API_BASE = "https://www.tpex.org.tw/www/zh-tw"
-HEADERS  = {
+TPEX_API  = "https://www.tpex.org.tw/www/zh-tw"
+HEADERS   = {
     "Content-Type":    "application/x-www-form-urlencoded; charset=UTF-8",
-    "Accept":          "application/json, text/javascript, */*; q=0.01",
     "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "Referer":         "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
     "X-Requested-With":"XMLHttpRequest",
 }
+TPEX_SOURCES = {
+    "TPEX-OTC": "bulletin/disposal",
+    "TPEX-ESB": "bulletin/disposalEsb",
+}
+TPEX_HISTORY_START = "2011/04/01"
 
-# TPEX data starts from 2011-04-01
-TPEX_START = "20110401"
 
-
-# ── Date helpers ──────────────────────────────────────────────────────────────
 def tw_date_to_iso(s: str) -> Optional[date]:
     try:
-        parts = s.strip().split("/")
-        return date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+        p = s.strip().split("/")
+        return date(int(p[0]) + 1911, int(p[1]), int(p[2]))
     except Exception:
         return None
 
 
 def parse_period(s: str) -> tuple[Optional[date], Optional[date]]:
     try:
-        parts = re.split(r"[～~]", s.strip())
-        return tw_date_to_iso(parts[0]), tw_date_to_iso(parts[1]) if len(parts) > 1 else None
+        p = re.split(r"[～~]", s.strip())
+        return tw_date_to_iso(p[0]), tw_date_to_iso(p[1]) if len(p) > 1 else None
     except Exception:
         return None, None
 
@@ -89,58 +79,62 @@ def trading_exit_date(start: date, n: int = 6) -> Optional[date]:
         return None
 
 
-# ── TPEX API ──────────────────────────────────────────────────────────────────
-def fetch_tpex(action: str, start_date: str, end_date: str) -> list[dict]:
-    url    = f"{API_BASE}/{action}"
+def fetch_tpex_csv(action: str, source_name: str,
+                   start_date: str, end_date: str) -> list[dict]:
+    """
+    Download TPEX disposal CSV and parse into records.
+    Dates must be YYYY/MM/DD format.
+    """
+    url    = f"{TPEX_API}/{action}"
     params = urllib.parse.urlencode({
-        "startDate": start_date, "endDate": end_date,
+        "startDate": start_date,
+        "endDate":   end_date,
         "type": "all", "reason": "-1", "measure": "-1",
-        "order": "date", "response": "json",
+        "order": "date", "response": "csv",
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=params, headers=HEADERS, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("ms950", errors="replace")
 
-    if data.get("stat") != "ok":
-        raise RuntimeError(f"API stat={data.get('stat')}")
-
-    tables = data.get("tables", [])
-    if not tables or "data" not in tables[0] or tables[0]["data"] is None:
-        return []
-
-    fields = tables[0]["fields"]
-    rows   = tables[0]["data"]
+    lines = raw.splitlines()
+    # Line 0: title, Line 1: period/range, Line 2: column headers, Line 3+: data
+    data_lines = lines[3:]
 
     records = []
-    for row in rows:
-        r = dict(zip(fields, row))
+    reader = csv.reader(data_lines)
+    for row in reader:
+        if len(row) < 5:
+            continue
+        try:
+            code = row[2].strip()
+            name = re.sub(r'\s*\(.*?\)\s*$', '', row[3]).strip()
+            if not code or not name:
+                continue
 
-        code = str(r.get("證券代號", "")).strip()
-        name = re.sub(r"\(.*?\)$", "", str(r.get("證券名稱", ""))).strip()
-        if not code or not name:
-            continue  # skip "本日無處置資料" rows
+            announce_d     = tw_date_to_iso(row[1])
+            start_d, end_d = parse_period(row[4])
 
-        announce_date          = tw_date_to_iso(str(r.get("公布日期", "")))
-        start_date_d, end_date = parse_period(str(r.get("處置起訖時間", "")))
+            records.append({
+                "source":        source_name,
+                "announce_date": announce_d,
+                "stock_code":    code,
+                "stock_name":    name,
+                "punish_count":  None,
+                "condition":     row[5].strip() if len(row) > 5 else None,
+                "start_date":    start_d,
+                "end_date":      end_d,
+                "exit_date":     trading_exit_date(start_d, 6),
+                "measure":       None,
+                "content":       row[6].strip() if len(row) > 6 else None,
+                "remark":        None,
+            })
+        except Exception:
+            pass
 
-        records.append({
-            "announce_date": announce_date,
-            "stock_code":    code,
-            "stock_name":    name,
-            "punish_count":  int(r["累計"]) if str(r.get("累計","")).isdigit() else None,
-            "condition":     str(r.get("處置原因", "")).strip(),
-            "start_date":    start_date_d,
-            "end_date":      end_date,
-            "exit_date":     trading_exit_date(start_date_d, 6),
-            "measure":       None,   # TPEX doesn't have this field
-            "content":       str(r.get("處置內容", "")).strip(),
-            "remark":        None,
-        })
     return records
 
 
-# ── DB ────────────────────────────────────────────────────────────────────────
 def upsert_records(records: list[dict], source: str) -> tuple[int, int]:
     conn = psycopg2.connect(**DB_CONFIG, connect_timeout=10)
     inserted = skipped = 0
@@ -148,8 +142,6 @@ def upsert_records(records: list[dict], source: str) -> tuple[int, int]:
         with conn:
             with conn.cursor() as cur:
                 for r in records:
-                    # Use WHERE NOT EXISTS to handle NULL start_date correctly
-                    # (ON CONFLICT can't handle NULLs in unique key columns reliably)
                     cur.execute("""
                         INSERT INTO disposal
                             (announce_date, stock_code, stock_name, punish_count,
@@ -164,7 +156,7 @@ def upsert_records(records: list[dict], source: str) -> tuple[int, int]:
                               AND stock_code    = %(stock_code)s
                               AND source        = %(source)s
                               AND (
-                                  (start_date IS NULL     AND %(start_date)s IS NULL)
+                                  (start_date IS NULL AND %(start_date)s IS NULL)
                                   OR start_date = %(start_date)s
                               )
                         )
@@ -178,61 +170,48 @@ def upsert_records(records: list[dict], source: str) -> tuple[int, int]:
     return inserted, skipped
 
 
-# ── Chunked date range ────────────────────────────────────────────────────────
-def date_chunks(start: str, end: str, chunk_days: int = 365):
-    """Split a date range into chunks to avoid huge API responses."""
-    s = datetime.strptime(start, "%Y%m%d").date()
-    e = datetime.strptime(end,   "%Y%m%d").date()
-    while s <= e:
-        chunk_end = min(s + timedelta(days=chunk_days - 1), e)
-        yield s.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")
-        s = chunk_end + timedelta(days=1)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def ingest_source(source_name: str, action: str, start: str, end: str):
     print(f"\n{'='*60}")
     print(f"Source: {source_name}  ({start} → {end})")
     print(f"{'='*60}")
 
-    total_inserted = total_skipped = 0
+    print(f"  Fetching CSV...", end=" ", flush=True)
+    try:
+        records = fetch_tpex_csv(action, source_name, start, end)
+        print(f"{len(records)} records fetched")
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 0
 
-    for chunk_start, chunk_end in date_chunks(start, end, chunk_days=365):
-        print(f"  Fetching {chunk_start}~{chunk_end} ...", end=" ", flush=True)
-        try:
-            records = fetch_tpex(action, chunk_start, chunk_end)
-            if not records:
-                print("0 rows")
-                continue
-            ins, skip = upsert_records(records, source_name)
-            total_inserted += ins
-            total_skipped  += skip
-            print(f"{len(records)} fetched → inserted={ins} skipped={skip}")
-            time.sleep(0.5)   # be polite to TPEX
-        except Exception as e:
-            print(f"ERROR: {e}")
-
-    print(f"\n  ✅ {source_name} done: inserted={total_inserted} skipped={total_skipped}")
-    return total_inserted
+    ins, skip = upsert_records(records, source_name)
+    print(f"  ✅ inserted={ins}  skipped={skip}")
+    return ins
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest TPEX disposal data into disposal table")
-    parser.add_argument("--start",  default=TPEX_START, help="Start date YYYYMMDD")
-    parser.add_argument("--end",    default=None,        help="End date YYYYMMDD (default: today TW)")
-    parser.add_argument("--source", default="all",       help="all | TPEX-OTC | TPEX-ESB")
+    parser = argparse.ArgumentParser(description="Ingest TPEX disposal CSV data into disposal table")
+    parser.add_argument("--start",  default=TPEX_HISTORY_START,
+                        help="Start date YYYY/MM/DD (default: 2011/04/01)")
+    parser.add_argument("--end",    default=None,
+                        help="End date YYYY/MM/DD (default: today TW)")
+    parser.add_argument("--source", default="all",
+                        help="all | TPEX-OTC | TPEX-ESB")
     args = parser.parse_args()
 
-    end = args.end or datetime.now(TW_TZ).strftime("%Y%m%d")
+    if args.end is None:
+        today = datetime.now(TW_TZ)
+        args.end = today.strftime("%Y/%m/%d")
 
-    sources = TPEX_SOURCES if args.source == "all" else {args.source: TPEX_SOURCES[args.source]}
-    if args.source != "all" and args.source not in TPEX_SOURCES:
+    if args.source == "all":
+        sources = TPEX_SOURCES
+    elif args.source in TPEX_SOURCES:
+        sources = {args.source: TPEX_SOURCES[args.source]}
+    else:
         print(f"Unknown source: {args.source}. Choose: all, TPEX-OTC, TPEX-ESB")
         sys.exit(1)
 
-    total = 0
     for name, action in sources.items():
-        total += ingest_source(name, action, args.start, end)
+        ingest_source(name, action, args.start, args.end)
 
     # Summary
     conn = psycopg2.connect(**DB_CONFIG)
