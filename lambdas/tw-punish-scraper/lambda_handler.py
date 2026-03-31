@@ -318,11 +318,11 @@ def get_active_positions(target_date: date) -> list[dict]:
     filtered = []
     for p in all_pos:
         try:
-            entry = nth_trading_day_after(p["start_date"], 2)
-            # Hold all the way to end_date (actual 處置 end)
-            if entry <= target_date <= p["end_date"]:
+            entry = nth_trading_day_after(p["start_date"], 2)   # start + 2 trading days
+            exit_ = nth_trading_day_before(p["end_date"],   2)  # end   - 2 trading days
+            if entry <= target_date <= exit_:
                 p["strategy_entry"] = entry
-                p["strategy_exit"]  = p["end_date"]
+                p["strategy_exit"]  = exit_
                 filtered.append(p)
         except Exception:
             pass
