@@ -228,11 +228,26 @@ def nth_trading_day_after(start: date, n: int) -> date:
     return dates[idx + n]
 
 
+def nth_trading_day_before(end: date, n: int) -> date:
+    """Return the date that is n trading days before end (XTAI calendar)."""
+    sessions = _TW_CAL.valid_days(
+        start_date=end - timedelta(days=60),
+        end_date=end,
+    )
+    dates = [s.date() for s in sessions]
+    # Find end in sessions (or closest trading day before)
+    idx = next((i for i in range(len(dates)-1, -1, -1) if dates[i] <= end), -1)
+    return dates[idx - n]
+
+
 def get_active_positions(target_date: date) -> list[dict]:
     """
-    Query DB for currently active 處置股 positions on target_date.
-    Only returns stocks where today is >= 2 trading days after start_date
-    (i.e. stock has been in 處置 for at least 2 trading days).
+    Query DB for strategy-active 處置股 positions on target_date.
+
+    Strategy window:
+        entry = start_date + 2 trading days
+        exit  = exit_date  - 2 trading days
+        Hold only while: entry <= target_date <= exit
     """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
@@ -261,13 +276,15 @@ def get_active_positions(target_date: date) -> list[dict]:
     finally:
         conn.close()
 
-    # Filter: only stocks where target_date >= start_date + 2 trading days
+    # Apply strategy window filter
     filtered = []
     for p in all_pos:
         try:
-            day2 = nth_trading_day_after(p["start_date"], 2)
-            if target_date >= day2:
-                p["day2_date"] = day2
+            entry = nth_trading_day_after(p["start_date"], 2)   # start + 2 trading days
+            exit_ = nth_trading_day_before(p["exit_date"], 2)   # exit  - 2 trading days
+            if entry <= target_date <= exit_:
+                p["strategy_entry"] = entry
+                p["strategy_exit"]  = exit_
                 filtered.append(p)
         except Exception:
             pass
@@ -329,8 +346,8 @@ def send_discord(date_str: str, inserted: int) -> None:
         for p in today_positions:
             if p["stock_code"] in added:
                 lines.append(
-                    f"  ＋ {p['stock_code']} {p['stock_name']}"
-                    f"　處置 {p['start_date']} ～ {p['exit_date']}"
+                    f"  ＋ **{p['stock_code']} {p['stock_name']}**"
+                    f"　持有 {p['strategy_entry']} ～ {p['strategy_exit']}"
                 )
 
     # ── Removed ─────────────────────────────────────────────────────
@@ -340,8 +357,8 @@ def send_discord(date_str: str, inserted: int) -> None:
         for p in prev_positions:
             if p["stock_code"] in removed:
                 lines.append(
-                    f"  － {p['stock_code']} {p['stock_name']}"
-                    f"　處置 {p['start_date']} ～ {p['exit_date']}"
+                    f"  － **{p['stock_code']} {p['stock_name']}**"
+                    f"　持有 {p['strategy_entry']} ～ {p['strategy_exit']}"
                 )
 
     # ── Current holdings ────────────────────────────────────────────
@@ -352,7 +369,7 @@ def send_discord(date_str: str, inserted: int) -> None:
             tag = " 🆕" if p["stock_code"] in added else ""
             lines.append(
                 f"  • **{p['stock_code']} {p['stock_name']}**{tag}"
-                f"　{p['start_date']} ～ {p['exit_date']}"
+                f"　{p['strategy_entry']} ～ {p['strategy_exit']}"
             )
 
     message = "\n".join(lines)
