@@ -287,6 +287,12 @@ def save_to_s3(all_records: dict[str, list], date_str: str) -> str:
 
 # ── Discord ───────────────────────────────────────────────────────────────────
 def get_active_positions(target_date: date) -> list[dict]:
+    """
+    Strategy window:
+        entry = start_date + 2 trading days
+        exit  = end_date  (actual 處置 end date)
+        Active when: entry <= target_date <= end_date
+    """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
@@ -295,10 +301,10 @@ def get_active_positions(target_date: date) -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT announce_date, stock_code, stock_name,
-                       start_date, exit_date, measure, source
+                       start_date, end_date, exit_date, measure, source
                 FROM disposal
-                WHERE start_date IS NOT NULL AND exit_date IS NOT NULL
-                  AND announce_date <= %(d)s AND exit_date >= %(d)s
+                WHERE start_date IS NOT NULL AND end_date IS NOT NULL
+                  AND announce_date <= %(d)s AND end_date >= %(d)s
                 ORDER BY source, announce_date DESC, stock_code
             """, {"d": target_date})
             all_pos = [dict(r) for r in cur.fetchall()]
@@ -309,10 +315,10 @@ def get_active_positions(target_date: date) -> list[dict]:
     for p in all_pos:
         try:
             entry = nth_trading_day_after(p["start_date"], 2)
-            exit_ = nth_trading_day_before(p["exit_date"], 2)
-            if entry <= target_date <= exit_:
+            # Hold all the way to end_date (actual 處置 end)
+            if entry <= target_date <= p["end_date"]:
                 p["strategy_entry"] = entry
-                p["strategy_exit"]  = exit_
+                p["strategy_exit"]  = p["end_date"]
                 filtered.append(p)
         except Exception:
             pass
@@ -320,6 +326,7 @@ def get_active_positions(target_date: date) -> list[dict]:
 
 
 def get_all_punished_today(target_date: date) -> list[dict]:
+    """All stocks currently in 處置 window (start_date <= today <= end_date), all sources."""
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
@@ -328,10 +335,10 @@ def get_all_punished_today(target_date: date) -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT announce_date, stock_code, stock_name,
-                       start_date, exit_date, measure, source
+                       start_date, end_date, measure, source
                 FROM disposal
-                WHERE start_date IS NOT NULL AND exit_date IS NOT NULL
-                  AND start_date <= %(d)s AND exit_date >= %(d)s
+                WHERE start_date IS NOT NULL AND end_date IS NOT NULL
+                  AND start_date <= %(d)s AND end_date >= %(d)s
                 ORDER BY source, start_date, stock_code
             """, {"d": target_date})
             return [dict(r) for r in cur.fetchall()]
@@ -428,7 +435,7 @@ def send_discord(date_str: str, inserted_by_source: dict[str, int]) -> None:
             tag    = source_tag.get(p["source"], p["source"])
             lines.append(
                 f"  {marker} {p['stock_code']} {p['stock_name']} `{tag}`"
-                f"　{p['start_date']} ～ {p['exit_date']}"
+                f"　{p['start_date']} ～ {p['end_date']}"
             )
 
     message = "\n".join(lines)
