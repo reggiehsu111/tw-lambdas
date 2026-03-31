@@ -291,6 +291,29 @@ def get_active_positions(target_date: date) -> list[dict]:
     return filtered
 
 
+def get_all_punished_today(target_date: date) -> list[dict]:
+    """All stocks currently in 處置 window on target_date (raw, no strategy filter)."""
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD,
+        connect_timeout=10,
+    )
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT announce_date, stock_code, stock_name, start_date, exit_date, measure
+                FROM tw_punish_stocks
+                WHERE start_date IS NOT NULL
+                  AND exit_date  IS NOT NULL
+                  AND start_date <= %(d)s
+                  AND exit_date  >= %(d)s
+                ORDER BY start_date, stock_code
+            """, {"d": target_date})
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def send_discord(date_str: str, inserted: int) -> None:
     if not DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL not set, skipping")
@@ -370,6 +393,19 @@ def send_discord(date_str: str, inserted: int) -> None:
             lines.append(
                 f"  • **{p['stock_code']} {p['stock_name']}**{tag}"
                 f"　{p['strategy_entry']} ～ {p['strategy_exit']}"
+            )
+
+    # ── All currently punished stocks (full 處置 window) ────────────
+    all_punished = get_all_punished_today(target_date)
+    if all_punished:
+        lines.append("")
+        lines.append(f"⚠️ **目前所有處置股** （共 {len(all_punished)} 檔）")
+        for p in all_punished:
+            in_strategy = p["stock_code"] in today_codes
+            marker = "✅" if in_strategy else "  "
+            lines.append(
+                f"  {marker} {p['stock_code']} {p['stock_name']}"
+                f"　{p['start_date']} ～ {p['exit_date']}"
             )
 
     message = "\n".join(lines)
