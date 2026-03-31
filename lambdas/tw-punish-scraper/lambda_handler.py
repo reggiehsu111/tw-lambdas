@@ -1,12 +1,13 @@
 """
 tw-punish-scraper
 
-每日從 TWSE 抓取處置有價證券清單，寫入 PostgreSQL (quant_data.disposal)，
+每日從三個來源抓取處置有價證券清單，寫入 PostgreSQL (quant_data.disposal)，
 存到 S3，並發 Discord 通知。
 
-TWSE API:
-  GET https://www.twse.com.tw/rwd/zh/announcement/punish
-      ?startDate=YYYYMMDD&endDate=YYYYMMDD&querytype=3&response=json
+Sources:
+  TWSE     (上市): https://www.twse.com.tw/rwd/zh/announcement/punish
+  TPEX-OTC (上櫃): https://www.tpex.org.tw/www/zh-tw/bulletin/disposal
+  TPEX-ESB (興櫃): https://www.tpex.org.tw/www/zh-tw/bulletin/disposalEsb
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone, date
 
 import boto3
@@ -25,54 +27,58 @@ import pandas_market_calendars as mcal
 
 _TW_CAL = mcal.get_calendar('XTAI')
 
-# ── Config from environment ───────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 S3_BUCKET           = os.environ.get("S3_BUCKET", "tw-lambdas-data")
 S3_PREFIX           = os.environ.get("S3_PREFIX", "punish")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-
-DB_HOST     = os.environ.get("DB_HOST", "quant-db.cluster-c1igmy0yu89z.ap-northeast-1.rds.amazonaws.com")
-DB_PORT     = int(os.environ.get("DB_PORT", "5432"))
-DB_NAME     = os.environ.get("DB_NAME", "quant_data")
-DB_USER     = os.environ.get("DB_USER", "quant_master")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "e74G2UWuxTDYr1j5Mtf7")
-
-TWSE_API = "https://www.twse.com.tw/rwd/zh/announcement/punish"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/143.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
-    "Referer": "https://www.twse.com.tw/zh/announcement/punish.html",
-    "X-Requested-With": "XMLHttpRequest",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
+DB_HOST             = os.environ.get("DB_HOST", "quant-db.cluster-c1igmy0yu89z.ap-northeast-1.rds.amazonaws.com")
+DB_PORT             = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME             = os.environ.get("DB_NAME", "quant_data")
+DB_USER             = os.environ.get("DB_USER", "quant_master")
+DB_PASSWORD         = os.environ.get("DB_PASSWORD", "e74G2UWuxTDYr1j5Mtf7")
 
 TW_TZ = timezone(timedelta(hours=8))
 
+# ── Source definitions ────────────────────────────────────────────────────────
+TWSE_API    = "https://www.twse.com.tw/rwd/zh/announcement/punish"
+TPEX_API    = "https://www.tpex.org.tw/www/zh-tw"
 
+TWSE_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+    "Referer":         "https://www.twse.com.tw/zh/announcement/punish.html",
+    "X-Requested-With":"XMLHttpRequest",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-origin",
+}
+TPEX_HEADERS = {
+    "Content-Type":    "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept":          "application/json, text/javascript, */*; q=0.01",
+    "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    "Referer":         "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
+    "X-Requested-With":"XMLHttpRequest",
+    "Origin":          "https://www.tpex.org.tw",
+}
+
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
 def get_today_tw() -> str:
     return datetime.now(TW_TZ).strftime("%Y%m%d")
 
 
-def tw_date_to_iso(tw_date: str) -> date | None:
-    """Convert ROC date string (115/03/26) → Python date (2026-03-26)."""
+def tw_date_to_iso(s: str) -> date | None:
     try:
-        parts = tw_date.strip().split("/")
-        year = int(parts[0]) + 1911
-        return date(year, int(parts[1]), int(parts[2]))
+        parts = s.strip().split("/")
+        return date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
     except Exception:
         return None
 
 
-def parse_period(period_str: str) -> tuple[date | None, date | None]:
-    """Parse '115/03/26～115/04/10' → (start_date, end_date) as Python dates."""
+def parse_period(s: str) -> tuple[date | None, date | None]:
     try:
-        parts = re.split(r"[～~]", period_str.strip())
+        parts = re.split(r"[～~]", s.strip())
         start = tw_date_to_iso(parts[0].strip()) if len(parts) > 0 else None
         end   = tw_date_to_iso(parts[1].strip()) if len(parts) > 1 else None
         return start, end
@@ -80,50 +86,53 @@ def parse_period(period_str: str) -> tuple[date | None, date | None]:
         return None, None
 
 
-def trading_exit_date(start_date: date, n_trading_days: int = 6) -> date | None:
-    """Return start_date + n trading days (XTAI calendar)."""
-    if start_date is None:
+def trading_exit_date(start: date, n: int = 6) -> date | None:
+    if not start:
         return None
     try:
-        sessions = _TW_CAL.valid_days(
-            start_date=start_date,
-            end_date=date(start_date.year, start_date.month, start_date.day) + timedelta(days=60),
-        )
+        sessions = _TW_CAL.valid_days(start_date=start, end_date=start + timedelta(days=60))
         dates = [s.date() for s in sessions]
-        idx = dates.index(start_date) if start_date in dates else next(
-            i for i, d in enumerate(dates) if d >= start_date
-        )
-        return dates[idx + n_trading_days]
+        idx = dates.index(start) if start in dates else next(i for i, d in enumerate(dates) if d >= start)
+        return dates[idx + n]
     except Exception:
         return None
 
 
-def fetch_punish_data(date_str: str) -> dict:
+def nth_trading_day_after(start: date, n: int) -> date:
+    sessions = _TW_CAL.valid_days(start_date=start, end_date=start + timedelta(days=60))
+    dates = [s.date() for s in sessions]
+    idx = next((i for i, d in enumerate(dates) if d >= start), 0)
+    return dates[idx + n]
+
+
+def nth_trading_day_before(end: date, n: int) -> date:
+    sessions = _TW_CAL.valid_days(start_date=end - timedelta(days=60), end_date=end)
+    dates = [s.date() for s in sessions]
+    idx = next((i for i in range(len(dates)-1, -1, -1) if dates[i] <= end), -1)
+    return dates[idx - n]
+
+
+# ── Fetchers ──────────────────────────────────────────────────────────────────
+def fetch_twse(date_str: str) -> list[dict]:
+    """Fetch TWSE (上市) disposal data."""
     import time as _time
     cache_bust = int(_time.time() * 1000)
     url = (
-        f"{TWSE_API}"
-        f"?startDate={date_str}&endDate={date_str}"
-        f"&querytype=3"
-        f"&stockNo=&selectType=&proceType=&remarkType="
-        f"&sortKind=DATE"
-        f"&response=json"
-        f"&_={cache_bust}"
+        f"{TWSE_API}?startDate={date_str}&endDate={date_str}"
+        f"&querytype=3&stockNo=&selectType=&proceType=&remarkType="
+        f"&sortKind=DATE&response=json&_={cache_bust}"
     )
-    print(f"Fetching: {url}")
-    req = urllib.request.Request(url, headers=HEADERS)
+    print(f"[TWSE] Fetching: {url}")
+    req = urllib.request.Request(url, headers=TWSE_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
+            data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code} fetching TWSE API") from e
-    data = json.loads(raw)
+        raise RuntimeError(f"TWSE HTTP {e.code}") from e
+
     if data.get("stat") != "OK":
-        raise RuntimeError(f"TWSE API returned stat={data.get('stat')}")
-    return data
+        raise RuntimeError(f"TWSE stat={data.get('stat')}")
 
-
-def parse_records(data: dict) -> list[dict]:
     fields = data.get("fields", [])
     rows   = data.get("data", [])
     records = []
@@ -131,157 +140,176 @@ def parse_records(data: dict) -> list[dict]:
 
     for row in rows:
         r = dict(zip(fields, row))
-        stock_code   = str(r.get("證券代號", "")).strip()
-        announce_date = tw_date_to_iso(str(r.get("公布日期", "")))
+        code         = str(r.get("證券代號", "")).strip()
+        announce_d   = tw_date_to_iso(str(r.get("公布日期", "")))
         period_str   = str(r.get("處置起迄時間", "")).strip()
-        start_date, end_date = parse_period(period_str)
-
-        key = (stock_code, str(announce_date), str(start_date))
-        if key in seen:
+        start_d, end_d = parse_period(period_str)
+        key = (code, str(announce_d), str(start_d))
+        if key in seen or not code:
             continue
         seen.add(key)
-
-        # Strip HTML from remark field
         remark_raw = str(r.get("備註", ""))
-        remark_clean = re.sub(r"<[^>]+>", "", remark_raw).strip()
-
         records.append({
-            "announce_date": announce_date,
-            "stock_code":    stock_code,
+            "source":        "TWSE",
+            "announce_date": announce_d,
+            "stock_code":    code,
             "stock_name":    str(r.get("證券名稱", "")).strip(),
             "punish_count":  r.get("累計"),
             "condition":     str(r.get("處置條件", "")).strip(),
-            "start_date":    start_date,
-            "end_date":      end_date,
-            "exit_date":     trading_exit_date(start_date, 6),  # 6 trading days from start
+            "start_date":    start_d,
+            "end_date":      end_d,
+            "exit_date":     trading_exit_date(start_d, 6),
             "measure":       str(r.get("處置措施", "")).strip(),
             "content":       str(r.get("處置內容", "")).strip(),
-            "remark":        remark_clean or None,
+            "remark":        re.sub(r"<[^>]+>", "", remark_raw).strip() or None,
         })
-
-    records.sort(key=lambda x: (str(x["announce_date"]), x["stock_code"]), reverse=True)
+    print(f"[TWSE] {len(records)} records")
     return records
 
 
+def fetch_tpex(action: str, source_name: str) -> list[dict]:
+    """Fetch TPEX (上櫃/興櫃) disposal data — returns current active disposals."""
+    url    = f"{TPEX_API}/{action}"
+    params = urllib.parse.urlencode({
+        "startDate": "20110401", "endDate": get_today_tw(),
+        "type": "all", "reason": "-1", "measure": "-1",
+        "order": "date", "response": "json",
+    }).encode("utf-8")
+
+    print(f"[{source_name}] Fetching: {url}")
+    req = urllib.request.Request(url, data=params, headers=TPEX_HEADERS, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"{source_name} fetch failed: {e}") from e
+
+    if data.get("stat") != "ok":
+        raise RuntimeError(f"{source_name} stat={data.get('stat')}")
+
+    tables = data.get("tables", [])
+    if not tables or "data" not in tables[0] or not tables[0]["data"]:
+        return []
+
+    fields = tables[0]["fields"]
+    rows   = tables[0]["data"]
+    records = []
+
+    for row in rows:
+        r    = dict(zip(fields, row))
+        code = str(r.get("證券代號", "")).strip()
+        name = re.sub(r"\(.*?\)$", "", str(r.get("證券名稱", ""))).strip()
+        if not code or not name:
+            continue
+
+        announce_d          = tw_date_to_iso(str(r.get("公布日期", "")))
+        start_d, end_d      = parse_period(str(r.get("處置起訖時間", "")))
+        punish_raw          = str(r.get("累計", ""))
+
+        records.append({
+            "source":        source_name,
+            "announce_date": announce_d,
+            "stock_code":    code,
+            "stock_name":    name,
+            "punish_count":  int(punish_raw) if punish_raw.isdigit() else None,
+            "condition":     str(r.get("處置原因", "")).strip(),
+            "start_date":    start_d,
+            "end_date":      end_d,
+            "exit_date":     trading_exit_date(start_d, 6),
+            "measure":       None,
+            "content":       str(r.get("處置內容", "")).strip(),
+            "remark":        None,
+        })
+    print(f"[{source_name}] {len(records)} records")
+    return records
+
+
+# ── DB ────────────────────────────────────────────────────────────────────────
 def write_to_db(records: list[dict]) -> int:
-    """Upsert records into disposal. Returns number of rows inserted."""
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD,
-        connect_timeout=10,
+        user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
     )
+    inserted = 0
     try:
         with conn:
             with conn.cursor() as cur:
-                inserted = 0
                 for r in records:
                     cur.execute("""
                         INSERT INTO disposal
                             (announce_date, stock_code, stock_name, punish_count,
-                             condition, start_date, end_date, exit_date, measure, content, remark)
-                        VALUES
-                            (%(announce_date)s, %(stock_code)s, %(stock_name)s, %(punish_count)s,
-                             %(condition)s, %(start_date)s, %(end_date)s, %(exit_date)s,
-                             %(measure)s, %(content)s, %(remark)s)
-                        ON CONFLICT (announce_date, stock_code, start_date) DO NOTHING
+                             condition, start_date, end_date, exit_date,
+                             measure, content, remark, source)
+                        SELECT %(announce_date)s, %(stock_code)s, %(stock_name)s, %(punish_count)s,
+                               %(condition)s, %(start_date)s, %(end_date)s, %(exit_date)s,
+                               %(measure)s, %(content)s, %(remark)s, %(source)s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM disposal
+                            WHERE announce_date = %(announce_date)s
+                              AND stock_code    = %(stock_code)s
+                              AND source        = %(source)s
+                              AND (
+                                  (start_date IS NULL AND %(start_date)s IS NULL)
+                                  OR start_date = %(start_date)s
+                              )
+                        )
                     """, r)
-                    inserted += cur.rowcount
-        print(f"DB: inserted {inserted} new rows (skipped {len(records) - inserted} duplicates)")
-        return inserted
+                    if cur.rowcount:
+                        inserted += 1
     finally:
         conn.close()
+    print(f"DB: inserted {inserted} / {len(records)} records")
+    return inserted
 
 
-def save_to_s3(records: list[dict], date_str: str) -> str:
-    s3 = boto3.client("s3")
+# ── S3 ────────────────────────────────────────────────────────────────────────
+def save_to_s3(all_records: dict[str, list], date_str: str) -> str:
+    s3     = boto3.client("s3")
     s3_key = f"{S3_PREFIX}/{date_str[:4]}/{date_str[4:6]}/{date_str}.json"
 
-    # Convert date objects to strings for JSON serialisation
-    serialisable = [
-        {k: (v.isoformat() if isinstance(v, date) else v) for k, v in r.items()}
-        for r in records
-    ]
+    def serialise(r):
+        return {k: (v.isoformat() if isinstance(v, date) else v) for k, v in r.items()}
+
     payload = {
         "scrape_date":     date_str,
         "scrape_time_utc": datetime.utcnow().isoformat() + "Z",
-        "total":           len(records),
-        "records":         serialisable,
+        "sources":         {src: [serialise(r) for r in recs] for src, recs in all_records.items()},
+        "total":           sum(len(v) for v in all_records.values()),
     }
     s3.put_object(
         Bucket=S3_BUCKET, Key=s3_key,
         Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
         ContentType="application/json; charset=utf-8",
     )
-    print(f"S3: saved {len(records)} records to s3://{S3_BUCKET}/{s3_key}")
+    print(f"S3: saved to s3://{S3_BUCKET}/{s3_key}")
     return s3_key
 
 
-def nth_trading_day_after(start: date, n: int) -> date:
-    """Return the date that is n trading days after start (XTAI calendar)."""
-    sessions = _TW_CAL.valid_days(
-        start_date=start,
-        end_date=start + timedelta(days=60),
-    )
-    dates = [s.date() for s in sessions]
-    # Find start in sessions (or next trading day)
-    idx = next((i for i, d in enumerate(dates) if d >= start), 0)
-    return dates[idx + n]
-
-
-def nth_trading_day_before(end: date, n: int) -> date:
-    """Return the date that is n trading days before end (XTAI calendar)."""
-    sessions = _TW_CAL.valid_days(
-        start_date=end - timedelta(days=60),
-        end_date=end,
-    )
-    dates = [s.date() for s in sessions]
-    # Find end in sessions (or closest trading day before)
-    idx = next((i for i in range(len(dates)-1, -1, -1) if dates[i] <= end), -1)
-    return dates[idx - n]
-
-
+# ── Discord ───────────────────────────────────────────────────────────────────
 def get_active_positions(target_date: date) -> list[dict]:
-    """
-    Query DB for strategy-active 處置股 positions on target_date.
-
-    Strategy window:
-        entry = start_date + 2 trading days
-        exit  = exit_date  - 2 trading days
-        Hold only while: entry <= target_date <= exit
-    """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD,
-        connect_timeout=10,
+        user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
     )
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT
-                    announce_date,
-                    stock_code,
-                    stock_name,
-                    start_date,
-                    exit_date,
-                    measure
+                SELECT announce_date, stock_code, stock_name,
+                       start_date, exit_date, measure, source
                 FROM disposal
-                WHERE
-                    start_date IS NOT NULL
-                    AND exit_date IS NOT NULL
-                    AND announce_date <= %(d)s
-                    AND exit_date     >= %(d)s
-                ORDER BY announce_date DESC, stock_code
+                WHERE start_date IS NOT NULL AND exit_date IS NOT NULL
+                  AND announce_date <= %(d)s AND exit_date >= %(d)s
+                ORDER BY source, announce_date DESC, stock_code
             """, {"d": target_date})
             all_pos = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-    # Apply strategy window filter
     filtered = []
     for p in all_pos:
         try:
-            entry = nth_trading_day_after(p["start_date"], 2)   # start + 2 trading days
-            exit_ = nth_trading_day_before(p["exit_date"], 2)   # exit  - 2 trading days
+            entry = nth_trading_day_after(p["start_date"], 2)
+            exit_ = nth_trading_day_before(p["exit_date"], 2)
             if entry <= target_date <= exit_:
                 p["strategy_entry"] = entry
                 p["strategy_exit"]  = exit_
@@ -292,29 +320,26 @@ def get_active_positions(target_date: date) -> list[dict]:
 
 
 def get_all_punished_today(target_date: date) -> list[dict]:
-    """All stocks currently in 處置 window on target_date (raw, no strategy filter)."""
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD,
-        connect_timeout=10,
+        user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
     )
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT announce_date, stock_code, stock_name, start_date, exit_date, measure
+                SELECT announce_date, stock_code, stock_name,
+                       start_date, exit_date, measure, source
                 FROM disposal
-                WHERE start_date IS NOT NULL
-                  AND exit_date  IS NOT NULL
-                  AND start_date <= %(d)s
-                  AND exit_date  >= %(d)s
-                ORDER BY start_date, stock_code
+                WHERE start_date IS NOT NULL AND exit_date IS NOT NULL
+                  AND start_date <= %(d)s AND exit_date >= %(d)s
+                ORDER BY source, start_date, stock_code
             """, {"d": target_date})
             return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
 
-def send_discord(date_str: str, inserted: int) -> None:
+def send_discord(date_str: str, inserted_by_source: dict[str, int]) -> None:
     if not DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL not set, skipping")
         return
@@ -322,25 +347,20 @@ def send_discord(date_str: str, inserted: int) -> None:
     target_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:]))
     date_label  = target_date.isoformat()
 
-    # Get previous trading day's positions for diff
+    # Previous trading day
     try:
         prev_sessions = _TW_CAL.valid_days(
-            start_date=target_date - timedelta(days=10),
-            end_date=target_date,
-        )
-        prev_dates = [s.date() for s in prev_sessions]
-        prev_date = prev_dates[-2] if len(prev_dates) >= 2 else target_date - timedelta(days=1)
+            start_date=target_date - timedelta(days=10), end_date=target_date)
+        prev_date = [s.date() for s in prev_sessions][-2]
     except Exception:
         prev_date = target_date - timedelta(days=1)
 
     today_positions = get_active_positions(target_date)
     prev_positions  = get_active_positions(prev_date)
-
     today_codes = {p["stock_code"] for p in today_positions}
     prev_codes  = {p["stock_code"] for p in prev_positions}
-
-    added   = today_codes - prev_codes   # newly entered (just hit 2-day mark)
-    removed = prev_codes  - today_codes  # exited today
+    added       = today_codes - prev_codes
+    removed     = prev_codes  - today_codes
 
     n_today = len(today_positions)
     n_prev  = len(prev_positions)
@@ -348,9 +368,12 @@ def send_discord(date_str: str, inserted: int) -> None:
     w_prev  = round(1.0 / n_prev,  4) if n_prev  > 0 else 0
     w_delta = w_today - w_prev
 
+    # Source labels
+    source_tag = {"TWSE": "上市", "TPEX-OTC": "上櫃", "TPEX-ESB": "興櫃"}
+    new_counts = " | ".join(f"{source_tag.get(s,s)} +{c}" for s, c in inserted_by_source.items() if c > 0)
+
     lines = [f"📋 **{date_label} 處置股策略** （處置第2日起）"]
 
-    # ── Weight summary ──────────────────────────────────────────────
     if n_today == 0:
         lines.append("今日無持倉")
     else:
@@ -358,44 +381,43 @@ def send_discord(date_str: str, inserted: int) -> None:
         if w_delta != 0 and n_prev > 0:
             sign = "+" if w_delta > 0 else ""
             w_change_str = f"　({sign}{w_delta*100:.2f}%)"
-        lines.append(
-            f"持倉 **{n_today}** 檔　各佔 **{w_today*100:.2f}%**{w_change_str}"
-        )
+        lines.append(f"持倉 **{n_today}** 檔　各佔 **{w_today*100:.2f}%**{w_change_str}")
+        if new_counts:
+            lines.append(f"今日新收錄：{new_counts}")
 
-    # ── Newly added ─────────────────────────────────────────────────
     if added:
         lines.append("")
         lines.append("🟢 **新增持倉**")
         for p in today_positions:
             if p["stock_code"] in added:
+                tag = source_tag.get(p["source"], p["source"])
                 lines.append(
-                    f"  ＋ **{p['stock_code']} {p['stock_name']}**"
-                    f"　持有 {p['strategy_entry']} ～ {p['strategy_exit']}"
+                    f"  ＋ **{p['stock_code']} {p['stock_name']}** `{tag}`"
+                    f"　{p['strategy_entry']} ～ {p['strategy_exit']}"
                 )
 
-    # ── Removed ─────────────────────────────────────────────────────
     if removed:
         lines.append("")
         lines.append("🔴 **移除持倉**")
         for p in prev_positions:
             if p["stock_code"] in removed:
+                tag = source_tag.get(p["source"], p["source"])
                 lines.append(
-                    f"  － **{p['stock_code']} {p['stock_name']}**"
-                    f"　持有 {p['strategy_entry']} ～ {p['strategy_exit']}"
+                    f"  － **{p['stock_code']} {p['stock_name']}** `{tag}`"
+                    f"　{p['strategy_entry']} ～ {p['strategy_exit']}"
                 )
 
-    # ── Current holdings ────────────────────────────────────────────
     if today_positions:
         lines.append("")
         lines.append("📌 **當前持倉**")
         for p in today_positions:
-            tag = " 🆕" if p["stock_code"] in added else ""
+            tag   = source_tag.get(p["source"], p["source"])
+            new_m = " 🆕" if p["stock_code"] in added else ""
             lines.append(
-                f"  • **{p['stock_code']} {p['stock_name']}**{tag}"
+                f"  • **{p['stock_code']} {p['stock_name']}**{new_m} `{tag}`"
                 f"　{p['strategy_entry']} ～ {p['strategy_exit']}"
             )
 
-    # ── All currently punished stocks (full 處置 window) ────────────
     all_punished = get_all_punished_today(target_date)
     if all_punished:
         lines.append("")
@@ -403,14 +425,13 @@ def send_discord(date_str: str, inserted: int) -> None:
         for p in all_punished:
             in_strategy = p["stock_code"] in today_codes
             marker = "✅" if in_strategy else "  "
+            tag    = source_tag.get(p["source"], p["source"])
             lines.append(
-                f"  {marker} {p['stock_code']} {p['stock_name']}"
+                f"  {marker} {p['stock_code']} {p['stock_name']} `{tag}`"
                 f"　{p['start_date']} ～ {p['exit_date']}"
             )
 
     message = "\n".join(lines)
-
-    # Discord 2000 char limit — split into chunks if needed
     chunks = []
     while len(message) > 1900:
         split = message[:1900].rfind("\n")
@@ -432,25 +453,61 @@ def send_discord(date_str: str, inserted: int) -> None:
             print(f"Discord notification failed (non-fatal): {e}")
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
 def lambda_handler(event, context):
     date_str = event.get("date") if isinstance(event, dict) else None
     if not date_str:
         date_str = get_today_tw()
 
-    print(f"Scraping 處置股 for date: {date_str}")
+    print(f"Scraping disposal data for date: {date_str}")
 
-    raw_data = fetch_punish_data(date_str)
-    records  = parse_records(raw_data)
-    print(f"Found {len(records)} unique records")
+    inserted_by_source = {}
+    all_records        = {}
 
-    inserted = write_to_db(records)
-    s3_key   = save_to_s3(records, date_str)
-    send_discord(date_str, inserted)
+    # 1. TWSE (上市)
+    try:
+        twse_records = fetch_twse(date_str)
+        ins = write_to_db(twse_records)
+        inserted_by_source["TWSE"] = ins
+        all_records["TWSE"] = twse_records
+    except Exception as e:
+        print(f"[TWSE] ERROR: {e}")
+        inserted_by_source["TWSE"] = 0
+        all_records["TWSE"] = []
+
+    # 2. TPEX-OTC (上櫃)
+    try:
+        otc_records = fetch_tpex("bulletin/disposal", "TPEX-OTC")
+        ins = write_to_db(otc_records)
+        inserted_by_source["TPEX-OTC"] = ins
+        all_records["TPEX-OTC"] = otc_records
+    except Exception as e:
+        print(f"[TPEX-OTC] ERROR: {e}")
+        inserted_by_source["TPEX-OTC"] = 0
+        all_records["TPEX-OTC"] = []
+
+    # 3. TPEX-ESB (興櫃)
+    try:
+        esb_records = fetch_tpex("bulletin/disposalEsb", "TPEX-ESB")
+        ins = write_to_db(esb_records)
+        inserted_by_source["TPEX-ESB"] = ins
+        all_records["TPEX-ESB"] = esb_records
+    except Exception as e:
+        print(f"[TPEX-ESB] ERROR: {e}")
+        inserted_by_source["TPEX-ESB"] = 0
+        all_records["TPEX-ESB"] = []
+
+    total_inserted = sum(inserted_by_source.values())
+    total_records  = sum(len(v) for v in all_records.values())
+    print(f"Total: {total_records} fetched, {total_inserted} new rows inserted")
+
+    s3_key = save_to_s3(all_records, date_str)
+    send_discord(date_str, inserted_by_source)
 
     return {
-        "statusCode": 200,
-        "date":       date_str,
-        "total":      len(records),
-        "inserted":   inserted,
-        "s3_key":     s3_key,
+        "statusCode":        200,
+        "date":              date_str,
+        "inserted":          inserted_by_source,
+        "total_fetched":     total_records,
+        "s3_key":            s3_key,
     }
