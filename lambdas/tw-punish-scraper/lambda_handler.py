@@ -216,8 +216,24 @@ def save_to_s3(records: list[dict], date_str: str) -> str:
     return s3_key
 
 
+def nth_trading_day_after(start: date, n: int) -> date:
+    """Return the date that is n trading days after start (XTAI calendar)."""
+    sessions = _TW_CAL.valid_days(
+        start_date=start,
+        end_date=start + timedelta(days=60),
+    )
+    dates = [s.date() for s in sessions]
+    # Find start in sessions (or next trading day)
+    idx = next((i for i, d in enumerate(dates) if d >= start), 0)
+    return dates[idx + n]
+
+
 def get_active_positions(target_date: date) -> list[dict]:
-    """Query DB for currently active 處置股 positions on target_date."""
+    """
+    Query DB for currently active 處置股 positions on target_date.
+    Only returns stocks where today is >= 2 trading days after start_date
+    (i.e. stock has been in 處置 for at least 2 trading days).
+    """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASSWORD,
@@ -241,9 +257,21 @@ def get_active_positions(target_date: date) -> list[dict]:
                     AND exit_date     >= %(d)s
                 ORDER BY announce_date DESC, stock_code
             """, {"d": target_date})
-            return [dict(r) for r in cur.fetchall()]
+            all_pos = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+    # Filter: only stocks where target_date >= start_date + 2 trading days
+    filtered = []
+    for p in all_pos:
+        try:
+            day2 = nth_trading_day_after(p["start_date"], 2)
+            if target_date >= day2:
+                p["day2_date"] = day2
+                filtered.append(p)
+        except Exception:
+            pass
+    return filtered
 
 
 def send_discord(date_str: str, inserted: int) -> None:
@@ -254,25 +282,80 @@ def send_discord(date_str: str, inserted: int) -> None:
     target_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:]))
     date_label  = target_date.isoformat()
 
-    positions = get_active_positions(target_date)
-    n         = len(positions)
-    weight    = round(1.0 / n, 4) if n > 0 else 0
+    # Get previous trading day's positions for diff
+    try:
+        prev_sessions = _TW_CAL.valid_days(
+            start_date=target_date - timedelta(days=10),
+            end_date=target_date,
+        )
+        prev_dates = [s.date() for s in prev_sessions]
+        prev_date = prev_dates[-2] if len(prev_dates) >= 2 else target_date - timedelta(days=1)
+    except Exception:
+        prev_date = target_date - timedelta(days=1)
 
-    if not positions:
-        message = f"📋 **{date_label} 處置股策略** — 今日無持倉"
+    today_positions = get_active_positions(target_date)
+    prev_positions  = get_active_positions(prev_date)
+
+    today_codes = {p["stock_code"] for p in today_positions}
+    prev_codes  = {p["stock_code"] for p in prev_positions}
+
+    added   = today_codes - prev_codes   # newly entered (just hit 2-day mark)
+    removed = prev_codes  - today_codes  # exited today
+
+    n_today = len(today_positions)
+    n_prev  = len(prev_positions)
+    w_today = round(1.0 / n_today, 4) if n_today > 0 else 0
+    w_prev  = round(1.0 / n_prev,  4) if n_prev  > 0 else 0
+    w_delta = w_today - w_prev
+
+    lines = [f"📋 **{date_label} 處置股策略** （處置第2日起）"]
+
+    # ── Weight summary ──────────────────────────────────────────────
+    if n_today == 0:
+        lines.append("今日無持倉")
     else:
-        lines = [
-            f"📋 **{date_label} 處置股策略**",
-            f"持倉 {n} 檔　各佔 {weight*100:.2f}%　新寫入 {inserted} 筆",
-            "",
-        ]
-        for p in positions:
+        w_change_str = ""
+        if w_delta != 0 and n_prev > 0:
+            sign = "+" if w_delta > 0 else ""
+            w_change_str = f"　({sign}{w_delta*100:.2f}%)"
+        lines.append(
+            f"持倉 **{n_today}** 檔　各佔 **{w_today*100:.2f}%**{w_change_str}"
+        )
+
+    # ── Newly added ─────────────────────────────────────────────────
+    if added:
+        lines.append("")
+        lines.append("🟢 **新增持倉**")
+        for p in today_positions:
+            if p["stock_code"] in added:
+                lines.append(
+                    f"  ＋ {p['stock_code']} {p['stock_name']}"
+                    f"　處置 {p['start_date']} ～ {p['exit_date']}"
+                )
+
+    # ── Removed ─────────────────────────────────────────────────────
+    if removed:
+        lines.append("")
+        lines.append("🔴 **移除持倉**")
+        for p in prev_positions:
+            if p["stock_code"] in removed:
+                lines.append(
+                    f"  － {p['stock_code']} {p['stock_name']}"
+                    f"　處置 {p['start_date']} ～ {p['exit_date']}"
+                )
+
+    # ── Current holdings ────────────────────────────────────────────
+    if today_positions:
+        lines.append("")
+        lines.append("📌 **當前持倉**")
+        for p in today_positions:
+            tag = " 🆕" if p["stock_code"] in added else ""
             lines.append(
-                f"• **{p['stock_code']} {p['stock_name']}**"
-                f"　公布 {p['announce_date']}"
+                f"  • **{p['stock_code']} {p['stock_name']}**{tag}"
                 f"　{p['start_date']} ～ {p['exit_date']}"
             )
-        message = "\n".join(lines)
+
+    message = "\n".join(lines)
 
     # Discord 2000 char limit — split into chunks if needed
     chunks = []
