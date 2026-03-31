@@ -62,7 +62,7 @@ def _load_punish_records(start_window: date, end_window: date) -> pd.DataFrame:
                 stock_name,
                 start_date,
                 exit_date
-            FROM tw_punish_stocks
+            FROM disposal
             WHERE
                 start_date  IS NOT NULL
                 AND exit_date IS NOT NULL

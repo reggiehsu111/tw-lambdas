@@ -1,7 +1,7 @@
 """
 tw-punish-scraper
 
-每日從 TWSE 抓取處置有價證券清單，寫入 PostgreSQL (quant_data.tw_punish_stocks)，
+每日從 TWSE 抓取處置有價證券清單，寫入 PostgreSQL (quant_data.disposal)，
 存到 S3，並發 Discord 通知。
 
 TWSE API:
@@ -164,7 +164,7 @@ def parse_records(data: dict) -> list[dict]:
 
 
 def write_to_db(records: list[dict]) -> int:
-    """Upsert records into tw_punish_stocks. Returns number of rows inserted."""
+    """Upsert records into disposal. Returns number of rows inserted."""
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASSWORD,
@@ -176,7 +176,7 @@ def write_to_db(records: list[dict]) -> int:
                 inserted = 0
                 for r in records:
                     cur.execute("""
-                        INSERT INTO tw_punish_stocks
+                        INSERT INTO disposal
                             (announce_date, stock_code, stock_name, punish_count,
                              condition, start_date, end_date, exit_date, measure, content, remark)
                         VALUES
@@ -264,7 +264,7 @@ def get_active_positions(target_date: date) -> list[dict]:
                     start_date,
                     exit_date,
                     measure
-                FROM tw_punish_stocks
+                FROM disposal
                 WHERE
                     start_date IS NOT NULL
                     AND exit_date IS NOT NULL
@@ -302,7 +302,7 @@ def get_all_punished_today(target_date: date) -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT announce_date, stock_code, stock_name, start_date, exit_date, measure
-                FROM tw_punish_stocks
+                FROM disposal
                 WHERE start_date IS NOT NULL
                   AND exit_date  IS NOT NULL
                   AND start_date <= %(d)s
