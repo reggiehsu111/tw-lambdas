@@ -290,12 +290,48 @@ def save_to_s3(all_records: dict[str, list], date_str: str) -> str:
 
 
 # ── Discord ───────────────────────────────────────────────────────────────────
+def normalise_stock_code(code: str) -> str | None:
+    """
+    Map non-4-digit codes to their 4-digit parent stock code.
+
+    Rules (Taiwan market conventions):
+      - Pure 4-digit number (e.g. 2330):          keep as-is
+      - 5-digit number (e.g. 23301):              first 4 digits = parent
+      - 6-digit number (warrant, e.g. 700715):    skip (warrant, no parent stock)
+      - 9-digit (ETF/fund with ="..." prefix):     skip
+      - 4-digit + letter (e.g. 1312A special):    first 4 digits
+      - Leading zero ETF (e.g. 00642U):           skip (ETF/fund)
+    Returns the 4-digit parent code, or None to exclude.
+    """
+    import re as _re
+    c = code.strip().lstrip('="').rstrip('"')  # strip CSV artifact
+
+    # Pure 4-digit: keep
+    if _re.match(r'^\d{4}$', c):
+        return c
+
+    # 5-digit: parent = first 4
+    if _re.match(r'^\d{5}$', c):
+        return c[:4]
+
+    # 4-digit + letter (special shares like 1312A): parent = first 4
+    if _re.match(r'^\d{4}[A-Z]$', c):
+        return c[:4]
+
+    # 6-digit warrant, 9-digit ETF, leading-zero ETF: skip
+    return None
+
+
 def get_active_positions(target_date: date) -> list[dict]:
     """
     Strategy window:
         entry = start_date + 2 trading days
-        exit  = end_date  (actual 處置 end date)
-        Active when: entry <= target_date <= end_date
+        exit  = end_date   - 2 trading days
+        Active when: entry <= target_date <= exit
+
+    Non-4-digit codes are mapped to their 4-digit parent.
+    Multiple instruments from the same parent are deduplicated — use
+    the earliest entry / latest exit across all of them.
     """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
@@ -315,22 +351,36 @@ def get_active_positions(target_date: date) -> list[dict]:
     finally:
         conn.close()
 
-    filtered = []
+    # Compute strategy window and deduplicate by (parent_code, source, start_date)
+    seen = {}   # key: (parent_code, source, start_date) → position dict
     for p in all_pos:
+        parent = normalise_stock_code(p["stock_code"])
+        if parent is None:
+            continue    # warrant / ETF — skip
         try:
-            entry = nth_trading_day_after(p["start_date"], 2)   # start + 2 trading days
-            exit_ = nth_trading_day_before(p["end_date"],   2)  # end   - 2 trading days
-            if entry <= target_date <= exit_:
-                p["strategy_entry"] = entry
-                p["strategy_exit"]  = exit_
-                filtered.append(p)
+            entry = nth_trading_day_after(p["start_date"], 2)
+            exit_ = nth_trading_day_before(p["end_date"],  2)
+            if not (entry <= target_date <= exit_):
+                continue
         except Exception:
-            pass
-    return filtered
+            continue
+
+        key = (parent, p["source"], p["start_date"])
+        if key not in seen:
+            p["parent_code"]    = parent
+            p["strategy_entry"] = entry
+            p["strategy_exit"]  = exit_
+            seen[key] = p
+        # else: already have this parent/start combo, skip duplicate instrument
+
+    return list(seen.values())
 
 
 def get_all_punished_today(target_date: date) -> list[dict]:
-    """All stocks currently in 處置 window (start_date <= today <= end_date), all sources."""
+    """
+    All stocks currently in 處置 window, mapped to 4-digit parent codes.
+    Deduplicates convertible bonds / warrants back to parent stock.
+    """
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
@@ -345,9 +395,20 @@ def get_all_punished_today(target_date: date) -> list[dict]:
                   AND start_date <= %(d)s AND end_date >= %(d)s
                 ORDER BY source, start_date, stock_code
             """, {"d": target_date})
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+    seen = {}
+    for p in rows:
+        parent = normalise_stock_code(p["stock_code"])
+        if parent is None:
+            continue
+        key = (parent, p["source"], p["start_date"])
+        if key not in seen:
+            p["parent_code"] = parent
+            seen[key] = p
+    return list(seen.values())
 
 
 def send_discord(date_str: str, inserted_by_source: dict[str, int]) -> None:
