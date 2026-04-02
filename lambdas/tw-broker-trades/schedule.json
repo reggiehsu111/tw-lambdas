@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "expression": "cron(30 9 ? * MON-FRI *)",
+  "description": "Run at 09:30 UTC (17:30 TW time) on weekdays — after market close + 30min buffer"
+}

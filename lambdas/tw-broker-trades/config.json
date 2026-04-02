@@ -1,0 +1,15 @@
+{
+  "function_name": "tw-broker-trades",
+  "description": "Daily 分點資料 ingestion for all TW stocks",
+  "handler": "lambda_handler.lambda_handler",
+  "runtime": "python3.11",
+  "timeout": 900,
+  "memory": 512,
+  "env_vars": {
+    "DB_HOST": "quant-db.cluster-c1igmy0yu89z.ap-northeast-1.rds.amazonaws.com",
+    "DB_PORT": "5432",
+    "DB_NAME": "quant_data",
+    "DB_USER": "quant_master",
+    "DB_PASSWORD": "set-in-lambda-env"
+  }
+}
