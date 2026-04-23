@@ -219,10 +219,22 @@ def lambda_handler(event, context):
     print(f"Universe: {len(universe)} stocks")
 
     # ── Already fully ingested? ───────────────────────────────────────────────
-    # Quick check: if 2330 (most liquid, always has data) is already in, skip
-    if not override_stocks and already_ingested(trade_date, "2330"):
-        print(f"  Data for {trade_date}/2330 already exists — skipping full run")
-        return {"statusCode": 200, "skipped": True, "reason": "already-ingested", "date": str(trade_date)}
+    force = event.get("force", False) if isinstance(event, dict) else False
+    if not override_stocks and not force and already_ingested(trade_date, "2330"):
+        # Count how many stocks already ingested today
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                                user=DB_USER, password=DB_PASSWORD, connect_timeout=10,
+                                sslmode='require')
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(DISTINCT stock_code) FROM broker_trades WHERE trade_date=%s",
+                        (trade_date,))
+            already_count = cur.fetchone()[0]
+        conn.close()
+        if already_count >= len(universe) * 0.9:  # 90% threshold = fully done
+            print(f"  {already_count}/{len(universe)} stocks already ingested for {trade_date} — skipping")
+            return {"statusCode": 200, "skipped": True, "reason": "already-ingested",
+                    "date": str(trade_date), "already_count": already_count}
+        print(f"  Partial data found ({already_count} stocks), resuming...")
 
     # ── Fetch & ingest ────────────────────────────────────────────────────────
     total_inserted  = 0
