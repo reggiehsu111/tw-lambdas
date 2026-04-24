@@ -358,8 +358,8 @@ def get_active_positions(target_date: date) -> list[dict]:
         if parent is None:
             continue    # warrant / ETF — skip
         try:
-            entry = nth_trading_day_after(p["start_date"], 1)   # start + 1 trading day
-            exit_ = nth_trading_day_before(p["end_date"],  2)
+            entry = nth_trading_day_after(p["start_date"], 2)   # start + 2 trading days
+            exit_ = nth_trading_day_after(entry, 5)             # hold for 5 trading days
             if not (entry <= target_date <= exit_):
                 continue
         except Exception:
@@ -444,7 +444,7 @@ def send_discord(date_str: str, inserted_by_source: dict[str, int]) -> None:
     source_tag = {"TWSE": "上市", "TPEX-OTC": "上櫃", "TPEX-ESB": "興櫃"}
     new_counts = " | ".join(f"{source_tag.get(s,s)} +{c}" for s, c in inserted_by_source.items() if c > 0)
 
-    lines = [f"📋 **{date_label} 處置股策略** （處置第1日起）"]
+    lines = [f"📋 **{date_label} 處置股策略** （start+2，持有5日）"]
 
     if n_today == 0:
         lines.append("今日無持倉")
